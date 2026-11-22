@@ -1,0 +1,20 @@
+# ============================================================
+# 运行时依赖（读表 / 业务分类 / 现金流 / 对方科目 / 分录测试）
+#
+# 安装（国内网络走阿里云源）：
+#   pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+#
+# 这份名单 = 运行时真实 import 到的 + 落 parquet 要用的 pyarrow。
+# 旧文件里那批 streamlit / fastapi / plotly / PyMuPDF 等已被归档的界面才用，
+# 装上来只是多等几分钟，别再加回来。
+#
+# 模型版还要再装 requirements-nn.txt（先单独装 CPU 版 torch，见该文件开头）。
+# ============================================================
+numpy==2.4.3
+pandas==2.3.3
+# pandas 读写 parquet 的引擎（任务产物、中间结果都用它，缺了跑不动）
+pyarrow==23.0.1
+# Excel 快速解析（Rust 实现，比 openpyxl 快 4 倍；.xls 也靠它）
+python-calamine==0.9.1
+# 写 xlsx（导出交付物）
+openpyxl==3.1.5

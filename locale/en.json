@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Audit workbench",
+    "description": "Brings the journal staged-task pipeline into DSH: the ledger is parsed once at task setup and shared by every feature; the task's own session does the AI review, artifacts land in the job directory."
+  }
+}

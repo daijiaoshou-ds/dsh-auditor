@@ -1,0 +1,372 @@
+# -*- coding: utf-8 -*-
+"""
+训练数据提取 — V3.0（BGE 微调）专用
+
+与旧版（legacy/data.py，jieba 分词 + 关键词白名单）完全不同：
+V3.0 输入是「整句摘要 + 科目开关向量」，不需要分词、关键词、白名单。
+
+规则:
+  - 按凭证号分组
+  - 桶取组内首个「业务分类」（V2.1 classify() 输出）
+  - 科目开关 = 一级科目+方向，格式 '科目[方向]'（如 '应付账款[借]'、'银行存款[贷]'）
+  - 摘要 = 组内全部非空摘要去重后以空格拼接（整句保留，供 BGE 编码）
+
+本模块顶层禁止 import torch/transformers —— V2.1 的 classify() 在
+无 torch 机器上也能正常导出训练数据（classifier.py 直接引用本模块）。
+"""
+
+import re
+from typing import Any, Dict, List, Optional, Set
+
+import numpy as np
+import pandas as pd
+
+from accounting_domain.subject_norm import normalize_name
+
+# ============================================================================
+# 常量
+# ============================================================================
+
+# 硬规则桶：由 V2.1 规则预分配（模式固定，无学习价值），不进入训练数据。
+# 「期末结转」同样是机械性结账（结转损益），模型不需要学——但它是可输出的
+# 桶，所以只在训练数据里排除，不放进 HARD_RULE_BUCKETS（那个集合同时用于
+# 推理侧「不参与打分」）。
+HARD_RULE_BUCKETS: Set[str] = {"资金内部往来", "汇兑损益"}
+
+
+def _load_non_train_buckets() -> Set[str]:
+    """从桶表读 `train: false` 的桶，让这个标记真正生效。
+
+    旧版把 train 只写在 JSON 里、全代码无人读取，标了 false 的桶照样进训练集。
+    这里直接读配置文件，避免顶层 import `core.classify.config`（本模块要求无重依赖）。
+    """
+    import json
+    from pathlib import Path
+    # 桶表在 `core/classify/assets/`。只用相对路径读 JSON，不 import
+    # `core.classify.config`——那会把这个"无重依赖"的模块拖进 torch 那一串。
+    path = (Path(__file__).resolve().parents[1]
+            / "classify" / "assets" / "bucket_taxonomy_v10.json")
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+        out = {name for name, info in cfg.get("buckets", {}).items()
+               if info.get("train") is False}
+        if out:
+            return out
+        print(f"[NN] 桶表里没有 train:false 的桶：{path}")
+        return {"期末结转"}
+    except Exception as exc:  # noqa: BLE001
+        # 退回静态集合，宁可少跳也不要把主力桶误跳掉；但**要说一声**——
+        # 静默退回去，下次挪目录又得靠人肉发现（挪过一次，栽在这里）。
+        print(f"[NN] 桶表读不到（{path}）：{exc}；train:false 回退成静态集合")
+        return {"期末结转"}
+
+
+# 默认跳过的桶 = 未分类 + 硬规则桶 + 桶表里标 train:false 的桶
+DEFAULT_SKIP_BUCKETS: Set[str] = (
+    {"未分类", "无法分类"} | HARD_RULE_BUCKETS | _load_non_train_buckets()
+)
+
+# 摘要长度上限（防御超长摘要；BGE 截断在 tokenizer 层做，这里是字符级防御）
+SUMMARY_MAX_CHARS = 200
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+# ============================================================================
+# 科目开关提取
+# ============================================================================
+
+def extract_subjects_from_group(
+    group: pd.DataFrame,
+    subject_col: str,
+    debit_col: str,
+    credit_col: str,
+) -> List[str]:
+    """提取一组凭证行的（一级科目, 方向）开关列表。
+
+    格式: '科目[方向]'，如 ['应付账款[借]', '银行存款[贷]']。
+    方向判定（按绝对值——红字凭证负金额不能被跳过）:
+      - |debit| > |credit|   → 借
+      - |credit| > 0（否则） → 贷
+      - 两者都是 0            → 跳过该行
+
+    负数处理（红字凭证）: 主营业务成本借 -500（冲减）仍记为
+    '主营业务成本[借]'——负金额行此前被 `-500 > 0` 判定跳过，
+    导致科目组合只剩一半（实测用户凭证只提取到银行存款）。
+
+    Args:
+        group: 单张凭证的所有分录行
+        subject_col: 科目列名
+        debit_col: 借方金额列名
+        credit_col: 贷方金额列名
+
+    Returns:
+        去重后的开关列表（'科目[方向]'），按字典序排序
+    """
+    switches: Set[str] = set()
+
+    for _, row in group.iterrows():
+        subject = row.get(subject_col)
+        if subject is None or (isinstance(subject, float) and pd.isna(subject)):
+            continue
+        subject = str(subject).strip()
+        if not subject:
+            continue
+
+        # 注意: NaN 是 truthy（bool(nan)==True），`x or 0` 不能把 NaN 变成 0！
+        # 必须用 pd.isna() 显式归一化，否则借方行被跳过（NaN > 0 恒为 False）
+        # 另兼容字符串金额（"100,000.00"）：先剥千分位再 coerce——
+        # 旧实现裸 to_numeric 把带千分位的文本判成 NaN → 整行跳过、
+        # 训练数据静默丢失（实测导出 0 条）
+        debit = pd.to_numeric(
+            str(row.get(debit_col)).replace(",", "").strip(), errors="coerce",
+        )
+        credit = pd.to_numeric(
+            str(row.get(credit_col)).replace(",", "").strip(), errors="coerce",
+        )
+        if pd.isna(debit):
+            debit = 0.0
+        if pd.isna(credit):
+            credit = 0.0
+
+        # 科目归一：剥二级后缀 + 别名折叠（应交税金→应交税费、基本生产成本→生产成本）
+        # 必须在拼组合之前做——否则「研发费用—折旧费」这类组合模型一个都没见过。
+        subject = normalize_name(subject)
+
+        if abs(debit) > abs(credit):
+            switches.add(f"{subject}[借]")
+        elif abs(credit) > 0:
+            switches.add(f"{subject}[贷]")
+
+    return sorted(switches)
+
+
+def extract_voucher_features(
+    df: pd.DataFrame,
+    voucher_col: str,
+    subject_col: str,
+    debit_col: str,
+    credit_col: str,
+    summary_col: str,
+) -> "tuple[Dict[str, List[str]], Dict[str, str]]":
+    """批量提取每张凭证的（科目开关, 拼接摘要）——向量化版本。
+
+    与 `extract_subjects_from_group` + `build_group_summary` 口径完全一致，
+    只是把「逐凭证 iterrows + 逐单元格 pd.to_numeric」换成整列向量化。
+    旧实现单张凭证要 5~20 次 to_numeric（每个单元格一次），1 万凭证时
+    占全链路耗时约 6 秒；这里每列只做一次。
+
+    Args:
+        df: 序时账（原始行级）
+        voucher_col/subject_col/debit_col/credit_col/summary_col: 列名，
+            debit_col/credit_col/summary_col 可为空串或不存在
+
+    Returns:
+        (subjects_map, summary_map)：凭证号(str) → ['科目[借]', ...] / 摘要
+    """
+    vid = df[voucher_col].astype(str)
+
+    # ── 科目开关 ──
+    subjects_map: Dict[str, List[str]] = {}
+    if subject_col in df.columns:
+        raw = df[subject_col]
+        name = raw.astype("string").str.strip()
+        valid = name.notna() & (name != "")
+
+        # 科目归一按唯一值映射一次（normalize_name 要剥后缀+查别名表）
+        uniq = pd.unique(name[valid].astype(str))
+        norm = {u: normalize_name(u) for u in uniq}
+
+        debit = _to_amount(df, debit_col)
+        credit = _to_amount(df, credit_col)
+        abs_d = debit.abs()
+        abs_c = credit.abs()
+
+        direction = pd.Series("", index=df.index, dtype="object")
+        direction[abs_d > abs_c] = "借"
+        direction[(abs_d <= abs_c) & (abs_c > 0)] = "贷"
+
+        keep = valid & (direction != "")
+        sw = pd.DataFrame({
+            "v": vid[keep],
+            "s": name[keep].astype(str).map(norm),
+            "d": direction[keep],
+            "i": np.arange(len(df))[keep.values],
+        })
+        sw["sw"] = sw["s"] + "[" + sw["d"] + "]"
+        # 组内字典序（等价于原实现 sorted(set)）；按首次出现位置稳定排序
+        sw = sw.sort_values(["v", "sw", "i"], kind="stable")
+        sw = sw.drop_duplicates(subset=["v", "sw"], keep="first")
+        for v, chunk in sw.groupby("v", sort=False):
+            subjects_map[str(v)] = chunk["sw"].tolist()
+
+    # ── 摘要拼接 ──
+    summary_map: Dict[str, str] = {}
+    if summary_col and summary_col in df.columns:
+        text = df[summary_col].astype("string")
+        text = text.where(text.notna(), "").str.replace(r"\s+", " ", regex=True)
+        text = text.str.strip()
+        frame = pd.DataFrame({
+            "v": vid, "t": text.astype(str),
+            "i": np.arange(len(df)),
+        })
+        frame = frame[frame["t"] != ""]
+        frame = frame.drop_duplicates(subset=["v", "t"], keep="first")
+        frame = frame.sort_values(["v", "i"], kind="stable")
+        joined = frame.groupby("v", sort=False)["t"].agg(" ".join)
+        summary_map = {str(v): t[:SUMMARY_MAX_CHARS] for v, t in joined.items()}
+
+    return subjects_map, summary_map
+
+
+def _to_amount(df: pd.DataFrame, col: str) -> pd.Series:
+    """整列安全转数字（兼容 '100,000.00' 千分位文本与空列）。"""
+    if not col or col not in df.columns:
+        return pd.Series(0.0, index=df.index, dtype="float64")
+    return pd.to_numeric(
+        df[col].astype(str).str.replace(",", "").str.strip(),
+        errors="coerce",
+    ).fillna(0.0).astype("float64")
+
+
+# ============================================================================
+# 训练记录提取
+# ============================================================================
+
+def build_group_summary(
+    group: pd.DataFrame,
+    summary_col: str,
+    max_chars: int = SUMMARY_MAX_CHARS,
+) -> str:
+    """组内全部非空摘要去重后空格拼接（训练/推理统一口径）。
+
+    多行凭证各行摘要可能不同，训练数据用的是「组内全部摘要拼接」；
+    推理侧若只取首行摘要，输入分布与训练不一致。classifier 融合
+    候选与本函数共用同一口径。
+    """
+    if not summary_col or summary_col not in group.columns:
+        return ""
+    summaries: List[str] = []
+    for text in group[summary_col].dropna().astype(str):
+        text = _WHITESPACE_RE.sub(" ", text).strip()
+        if text and text not in summaries:
+            summaries.append(text)
+    return " ".join(summaries)[:max_chars]
+
+
+def extract_training_records(
+    df: pd.DataFrame,
+    column_mapping: Dict[str, str],
+    skip_buckets: Optional[Set[str]] = None,
+    skip_voucher_ids: Optional[Set[str]] = None,
+    features: Optional["tuple[Dict[str, List[str]], Dict[str, str]]"] = None,
+) -> List[Dict[str, Any]]:
+    """从 V2.1 分类结果提取训练记录 [整句摘要, 科目组合, 桶]。
+
+    Args:
+        df: V2.1 classify() 输出（须含「业务分类」列）
+        column_mapping: {voucher_no, subject, debit, credit, summary}
+        skip_buckets: 跳过的桶集合，默认 DEFAULT_SKIP_BUCKETS
+        skip_voucher_ids: 按凭证号跳过的集合（字符串），默认不跳过任何凭证。
+            用于排除「期末结转」等机械性预分配凭证——它们归入"其他业务"桶
+            但无业务含义，混入训练会稀释"其他业务"的语义样本。
+
+    Returns:
+        [{"summary": str, "subjects": List[str], "bucket": str}, ...]
+
+    规则:
+      - 按凭证号分组，桶取组内首个「业务分类」，在 skip_buckets 内则跳过
+      - 凭证号在 skip_voucher_ids 内 → 跳过（机械预分配，无学习价值）
+      - subjects 为空 → 跳过（没有科目信号的凭证无法学习）
+      - 摘要为空 → 跳过（BGE 需要文本输入）
+    """
+    if skip_buckets is None:
+        skip_buckets = DEFAULT_SKIP_BUCKETS
+    skip_voucher_ids = skip_voucher_ids or set()
+
+    v_col = column_mapping["voucher_no"]
+    s_col = column_mapping["subject"]
+    d_col = column_mapping.get("debit", "")
+    c_col = column_mapping.get("credit", "")
+    sum_col = column_mapping.get("summary", "")
+
+    if "业务分类" not in df.columns:
+        raise ValueError("输入 DataFrame 缺少「业务分类」列（请先运行 V2.1 classify()）")
+
+    records: List[Dict[str, Any]] = []
+    skipped_no_bucket = 0
+    skipped_no_subject = 0
+    skipped_no_summary = 0
+    skipped_voucher = 0
+
+    # 科目组合/摘要一次批量算完（逐凭证 iterrows 太慢）；
+    # classifier 已算过时可通过 features= 直接复用，避免二次提取。
+    if features is None:
+        subj_map, sum_map = extract_voucher_features(
+            df, v_col, s_col, d_col, c_col, sum_col)
+    else:
+        subj_map, sum_map = features
+
+    for voucher_id, group in df.groupby(v_col, sort=False):
+        if str(voucher_id) in skip_voucher_ids:
+            skipped_voucher += 1
+            continue
+        bucket = group["业务分类"].iloc[0]
+        if bucket in skip_buckets:
+            skipped_no_bucket += 1
+            continue
+
+        subjects = subj_map.get(str(voucher_id)) or []
+        if not subjects:
+            skipped_no_subject += 1
+            continue
+
+        # 摘要：组内非空摘要去重后拼接（整句保留，与推理口径一致）
+        summary = sum_map.get(str(voucher_id), "")
+        if not summary:
+            skipped_no_summary += 1
+            continue
+
+        # 复核明细：从 classify() 写回的列里取首行（同凭证所有行一致）
+        import json as _json
+
+        def _first(col, default=""):
+            if col not in group.columns:
+                return default
+            val = group[col].iloc[0]
+            return default if pd.isna(val) else val
+
+        def _num(v):
+            if v in ("", None) or (isinstance(v, float) and pd.isna(v)):
+                return None
+            try:
+                return round(float(v), 4)
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            _t3 = _first("模型Top3", "[]")
+            top3 = _json.loads(_t3) if isinstance(_t3, str) and _t3 else []
+        except (ValueError, TypeError):
+            top3 = []
+
+        records.append({
+            "summary": summary,
+            "subjects": subjects,
+            "bucket": bucket,
+            "pred": {
+                "prob_raw": _num(_first("模型概率")),
+                "prob_cal": _num(_first("校准概率")),
+                "top3": top3,
+                "source": str(_first("判定来源", "程序(未入融合)")),
+                "postprocess": str(_first("后处理", "") or ""),
+            },
+        })
+
+    print(f"[OK] 训练记录提取: {len(records)} 条")
+    print(f"   跳过: {skipped_no_bucket} 凭证(桶被排除), "
+          f"{skipped_voucher} 凭证(机械预分配), "
+          f"{skipped_no_subject} 凭证(无科目), "
+          f"{skipped_no_summary} 凭证(无摘要)")
+
+    return records

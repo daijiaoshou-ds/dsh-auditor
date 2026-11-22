@@ -1,0 +1,22 @@
+# ============================================================
+# 模型版依赖（装完 requirements.txt 之后再装这一份）
+#
+#   ⚠️ torch **不要**写在 pip 默认源里装：Windows 上 PyPI（含阿里云/清华镜像）
+#      给的 torch 是 CUDA 版，下载 2.4GB、装完 4GB+；推理只用 CPU，122MB 就够。
+#
+#   正确顺序：
+#     1) CPU 版 torch（官方源；慢的话用交大镜像）
+#        pip install torch --index-url https://download.pytorch.org/whl/cpu
+#        pip install torch --index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cpu
+#     2) 本文件
+#        pip install -r requirements-nn.txt -i https://mirrors.aliyun.com/pypi/simple/
+#     3) 验证（必须带 +cpu，且 CUDA 是 None）
+#        python -c "import torch; print(torch.__version__, torch.version.cuda)"
+#
+# 实测通过组合（torch 2.13.0+cpu）：transformers 5.14.1 / safetensors 0.8.0 /
+# modelscope 1.39.1。
+# ============================================================
+transformers==5.14.1
+safetensors==0.8.0
+# 从 ModelScope 下 hajishou-V2.0（国内直连，不用翻墙）
+modelscope==1.39.1

@@ -1,0 +1,55 @@
+{
+  "name": "dsh-auditor",
+  "version": "0.1.0",
+  "private": false,
+  "description": "审计工作台：序时账清洗 / 现金流量表编写 / 对方科目分析 / 会计分录测试",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/daijiaoshou-ds/dsh-auditor.git"
+  },
+  "homepage": "https://github.com/daijiaoshou-ds/dsh-auditor#readme",
+  "bugs": {
+    "url": "https://github.com/daijiaoshou-ds/dsh-auditor/issues"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src/*.js",
+    "src/*.py",
+    "locale/*.json",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "INSTALL.md",
+    "engine/**"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "audit",
+    "journal",
+    "accounting"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

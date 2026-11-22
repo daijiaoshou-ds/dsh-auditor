@@ -1,0 +1,557 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join, resolve } from 'node:path'
+
+import { JournalError, runJournal } from './cli.js'
+import {
+  listFiles, readDecisions, readRequest, readState, scanJobs, stageRows,
+} from './store.js'
+import {
+  clamp,
+  formatFeatures,
+  formatInbox,
+  formatInspect,
+  formatNext,
+  formatReport,
+  formatStart,
+  formatSubmit,
+} from './format.js'
+
+/** `journal features` 要把每个功能都 import 一遍（连带 torch，约 5s），缓存一会儿。 */
+const FEATURES_TTL_MS = 10 * 60 * 1000
+
+/** `journal_next` 在任务跑着时最多等多久：够一次读表+一段分类推进。 */
+const WAIT_MS = 40_000
+
+/** 轮询 state.json 的间隔。文件很小，1.5s 一次对磁盘没压力。 */
+const POLL_MS = 1_500
+
+/** 这几个状态都算"还没跑完"：不该在这份账上再起第二个同样的功能。 */
+const BUSY_STATUS = new Set(['created', 'running', 'awaiting_review'])
+
+const STATUS_WORD = { created: '刚建', running: '正在跑', awaiting_review: '等复核' }
+
+/**
+ * 操作层：工具只做"参数校验 + 排版"，真正的事都在这里。
+ *
+ * 放在一处的理由是 `references/user-actions.md` 那条规矩：**一个操作只实现一次**，
+ * UI 按钮和 agent 工具都调同一个方法。M1 只有工具这一侧，M2 加页面时
+ * `/plugin/journal/*` 路由直接复用这些函数，不另写一套。
+ */
+export function createOps(settings, runner, notifier, tasks) {
+  const featureCache = new Map()
+
+  async function ctxFor(agent) {
+    const repo = await settings.repoFor(agent)
+    return { repo, python: settings.pythonFor(repo), jobs: settings.jobsFor(repo) }
+  }
+
+  async function call(ctx, args, timeoutMs = 180_000) {
+    const result = await runJournal({
+      python: ctx.python,
+      repo: ctx.repo,
+      args,
+      timeoutMs,
+      // 任务目录以插件配置为准（引擎读 JOURNAL_JOBS_DIR），避免两边各用默认值
+      env: { JOURNAL_JOBS_DIR: ctx.jobs },
+    })
+    if (!result.ok) throw new JournalError(result.error)
+    const value = result.value || {}
+    if (value.ok === false) throw new JournalError(value.error || '命令失败')
+    return value
+  }
+
+  function startBackground(ctx, jobId, label) {
+    runner.start({
+      jobId,
+      label,
+      repo: ctx.repo,
+      python: ctx.python,
+      args: ['resume', jobId],
+      timeoutMs: settings.timeoutMs,
+    })
+  }
+
+  /**
+   * "还在算吗"。
+   *
+   * 光看 `runner.isRunning` 不够：python 写完 `state.json`（已经停在复核位）到进程
+   * 真正退出之间还有几十毫秒，这时候状态说"该你判了"、runner 却说"在跑"。
+   * 所以**状态是权威**：已经停下（复核/完成/失败）就不算忙，哪怕进程还没退干净。
+   */
+  function isBusy(jobId, state) {
+    if (!runner.isRunning(jobId)) return false
+    const status = state?.status
+    return status !== 'awaiting_review' && status !== 'done' && status !== 'failed'
+  }
+
+  /** 这份账上这个功能有没有一个没跑完的运行（防止连点两下建出两个一样的任务）。 */
+  function activeRun(ctx, taskId, featureId) {
+    if (!taskId) return null
+    return scanJobs(ctx.jobs).find((job) => job.task === taskId
+      && job.feature === featureId && BUSY_STATUS.has(job.status)) || null
+  }
+
+  /**
+   * 这个功能该接谁的结果。
+   *
+   * 关系由功能自己声明（`accepts_upstream`：现金流声明了 cleaning），这里只按
+   * "这份账上那个功能跑完了没有"挑最新的一次。以前要用户自己在下拉里选"接上游"，
+   * 不选就重算一遍业务分类、再问一遍已经判过的桶——同一份账被判两次，两个结论
+   * 还可能不一样。现在默认接上，页面上没有那个选项了。
+   */
+  async function upstreamFor(agent, ctx, taskId, featureId) {
+    let manifest = []
+    try {
+      manifest = (await featuresRaw(agent)).features || []
+    } catch {
+      return { accept: [], job: '' }   // 清单拉不到就退回"自己载入分类"，别把开跑卡死
+    }
+    const want = (manifest.find((item) => item.id === featureId)?.accepts_upstream) || []
+    const accept = want.map((id) => ({
+      id,
+      name: (manifest.find((item) => item.id === id) || {}).name || id,
+    }))
+    if (!accept.length) return { accept, job: '' }
+    const ids = accept.map((item) => item.id)
+    const done = scanJobs(ctx.jobs).filter((job) => job.task === taskId
+      && ids.includes(job.feature) && job.status === 'done')
+    done.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+    return { accept, job: done[0]?.job_id || '' }
+  }
+
+  // ── 发现 ────────────────────────────────────────────────────────────────
+
+  async function features(agent) {
+    const ctx = await ctxFor(agent)
+    const cached = featureCache.get(ctx.repo)
+    if (cached && Date.now() - cached.at < FEATURES_TTL_MS) {
+      return clamp(formatFeatures(cached.value))
+    }
+    const value = await call(ctx, ['features'])
+    featureCache.set(ctx.repo, { at: Date.now(), value })
+    return clamp(formatFeatures(value))
+  }
+
+  async function inspect({ file, feature, domain }, agent) {
+    return clamp(formatInspect(await inspectRaw({ file, feature, domain }, agent)))
+  }
+
+  /** 和 `inspect` 同一个动作，只是把原始 JSON 交出去（页面要用它画映射表）。 */
+  async function inspectRaw({ file, feature, domain }, agent) {
+    const ctx = await ctxFor(agent)
+    const target = resolveInput(file, ctx.repo)
+    // 按域看表：字段空间是一个域的（5–8 个），不是二十个功能并集的几百个。
+    // 没给域时才退回按功能（老调用方只传 feature）。
+    const args = ['inspect', target]
+    const domainId = String(domain || '').trim()
+    if (domainId) args.push('--domain', domainId)
+    else args.push('--feature', String(feature || 'cleaning').trim())
+    return call(ctx, args, 300_000)
+  }
+
+  // ── 建任务 ──────────────────────────────────────────────────────────────
+
+  async function start({ feature, file, upstream, mapping, max_review, task }, agent) {
+    return clamp(formatStart(await startRaw({ feature, file, upstream, mapping, max_review, task }, agent)))
+  }
+
+  /** 建任务并在后台起跑，返回 `journal create` 的原始 payload（页面要 job_id）。 */
+  async function startRaw({ feature, file, upstream, mapping, max_review, task }, agent) {
+    const featureId = String(feature || '').trim()
+    if (!featureId) throw new JournalError('要给 feature；先用 journal_features 看有哪些功能。')
+
+    const ctx = await ctxFor(agent)
+    const taskId = String(task || '').trim()
+
+    // 同一份账、同一个功能只允许一个没跑完的运行。
+    // 连点两下「开始处理」会建出两个一模一样的任务：两个进程抢显存，页面上两个
+    // 都显示"正在跑"，用户看到的就是"点了两次之后变卡了"。
+    const busy = taskId ? activeRun(ctx, taskId, featureId) : null
+    if (busy) {
+      throw new JournalError(
+        `这个功能已经有一个没跑完的运行（${busy.job_id}，${STATUS_WORD[busy.status] || busy.status}）。`
+        + '等它跑完，或者先按「■ 中止」再重新开始。',
+      )
+    }
+
+    const args = ['create']
+    if (file) args.push(resolveInput(file, ctx.repo))
+    args.push('--feature', featureId)
+
+    // 上游：功能自己声明能接谁（`accepts_upstream`），这份账上那个功能跑完了就
+    // 默认接上。不接的话现金流会把"业务分类"重算一遍，再问一遍已经判过的桶——
+    // 同一份账被判两次，两个结论还可能不一样。
+    let up = String(upstream || '').trim()
+    if (!up && taskId) {
+      const found = await upstreamFor(agent, ctx, taskId, featureId)
+      up = found.job
+      // 声明了要接上游却没得接：这份账上的分类还没做。与其自己算一套（和清洗
+      // 那套未必一样），不如直接说清楚该先做什么。
+      if (!up && found.accept.length) {
+        const names = found.accept.map((item) => item.name).join('、')
+        throw new JournalError(
+          `这个功能要接「${names}」的结果，但它在当前任务上还没跑完。`
+          + '先在同一个任务里把它跑完，再开始这个功能。',
+        )
+      }
+    }
+    if (up) args.push('--option', `upstream=${up}`)
+    // 归属哪个任务：只用来把运行记录归到任务的账下面，不影响阶段哈希
+    if (taskId) args.push('--option', `task=${taskId}`)
+    // 已解析的账：配账阶段解析过一次，这里直接载入，不再各自读 xlsx
+    if (taskId && tasks?.ensure) {
+      const prepared = await tasks.ensure(agent, taskId)
+      args.push('--option', `prepared=${prepared}`)
+    }
+    if (max_review) args.push('--max-review', String(Math.max(1, Math.floor(Number(max_review)))))
+    const map = normalizeMapping(mapping)
+    if (map) args.push('--mapping', JSON.stringify(map))
+
+    // `create` 只建不跑：先拿到 job_id，才能在它跑的同时查状态（`run` 会阻塞到复核位）
+    const value = await call(ctx, args, 300_000)
+    // 记下"谁发起的"：跑完停在复核位时，只叫这个会话的 agent（M3）
+    notifier?.remember(value.job_id, agent)
+    // start 不算"正在驱动"：建完任务 agent 就该走了，之后正需要有人叫它回来
+    notifier?.touch(value.job_id, 'start')
+    startBackground(ctx, value.job_id, '开始跑')
+    return value
+  }
+
+  // ── 进度与待办 ──────────────────────────────────────────────────────────
+
+  async function next({ job_id, limit }, agent) {
+    const ctx = await ctxFor(agent)
+    const jobId = String(job_id || '').trim()
+
+    if (!jobId) {
+      const value = await call(ctx, ['inbox'], 60_000)
+      return clamp(formatInbox(value))
+    }
+
+    // agent 正在盯着这个任务：停位提醒就不必再发了
+    notifier?.touch(jobId, 'drive')
+
+    // 后台在跑：等一小会儿，阶段一推进就立刻返回。
+    // 不让 agent 自己空转轮询——一次工具调用等 40 秒，比"还在跑"重复十遍省得多。
+    if (runner.isRunning(jobId)) {
+      await waitForProgress(ctx.jobs, jobId, runner, WAIT_MS)
+    }
+
+    const state = readState(ctx.jobs, jobId)
+
+    if (isBusy(jobId, state)) {
+      // 真在算：不调 CLI（省 2~3 秒，也不跟正在写 state 的进程抢），
+      // 直接读 state.json + runner 攒的 stderr 尾巴。
+      return clamp(formatNext({
+        next: { job_id: jobId, status: state?.status || 'running' },
+        state,
+        stages: stageRows(state),
+        running: runner.snapshot(jobId),
+      }))
+    }
+
+    const rows = Math.min(60, Math.max(1, Math.floor(Number(limit) || settings.reviewLimit)))
+    let value
+    try {
+      value = await call(ctx, ['next', jobId, '--limit', String(rows)])
+    } catch (error) {
+      // 失败的任务里 `journal next` 返回 ok:false（只有 error 没有时间线）。
+      // 这时从 state.json 补一条阶段链出来——"哪一步炸的"比一句异常有用。
+      if (state?.status === 'failed') {
+        return clamp(formatNext({
+          next: { job_id: jobId, status: 'failed', error: state.error },
+          state,
+          stages: stageRows(state),
+        }))
+      }
+      throw error
+    }
+    const stage = value?.next?.stage
+    return clamp(formatNext({
+      next: value,
+      state,
+      stages: stageRows(state),
+      running: null,
+      request: readRequest(ctx.jobs, jobId, stage),
+      // 待办原文的绝对路径：整批都在这一份里，AI 想按模板分组时直接读它
+      requestPath: stage ? join(ctx.jobs, jobId, 'reviews', `${stage}.request.json`) : '',
+    }))
+  }
+
+  // ── 交结论 ──────────────────────────────────────────────────────────────
+
+  async function submit({ job_id, stage, decisions, waive }, agent) {
+    const { value, jobId } = await submitRaw({ job_id, stage, decisions, waive }, agent)
+    return clamp(formatSubmit(value, { resumed: true, jobId }))
+  }
+
+  /** 和 `submit` 同一个动作，返回回执原文（页面要显示采纳/驳回明细）。 */
+  async function submitRaw({ job_id, stage, decisions, waive }, agent) {
+    const jobId = String(job_id || '').trim()
+    if (!jobId) throw new JournalError('要给 job_id。')
+
+    const ctx = await ctxFor(agent)
+    const state = readState(ctx.jobs, jobId)
+    if (isBusy(jobId, state)) {
+      throw new JournalError('任务正在算，等它停到复核位再交结论（用 journal_next 看进度）。')
+    }
+    // `stage` 可以省：停着没交的那一段就是它（工具描述里这么承诺的）。不在这里
+    // 解析的话，写出去的 decision 文件缺 stage 字段，引擎直接拒——AI 得回头看
+    // journal_next 抄一遍阶段 id，白多一次往返。
+    const stages = state?.stages || {}
+    const sid = String(stage || '').trim()
+      || Object.keys(stages).find((id) => stages[id]?.status === 'awaiting')
+      || ''
+    if (!sid) throw new JournalError('现在没有在等复核的阶段（用 journal_next 看当前状态）。')
+    let cleanup = () => {}
+
+    try {
+      let value
+      if (waive) {
+        value = await call(ctx, ['submit', jobId, '--empty', '--stage', sid,
+          '--by', 'ai', '--no-advance'])
+      } else {
+        const list = Array.isArray(decisions) ? decisions : []
+        if (!list.length) {
+          throw new JournalError('decisions 是空的；一条都不改就用 waive（要和 stage 一起给）。')
+        }
+        const { file, dir } = writeDecisionFile({ stage: sid, decisions: list })
+        cleanup = () => rmSync(dir, { recursive: true, force: true })
+        const args = ['submit', jobId, '--file', file, '--by', 'ai', '--no-advance']
+        value = await call(ctx, args)
+      }
+      // 只落盘不往下跑（`--no-advance`）：下游可能是几分钟的分类，得丢后台。
+      notifier?.remember(jobId, agent)
+      // 它刚交完、马上就轮到它接着看：这时候别再往它 inbox 里塞一条（会过时）
+      notifier?.touch(jobId, 'drive')
+      startBackground(ctx, jobId, '继续跑')
+      return { value, jobId }
+    } finally {
+      cleanup()
+    }
+  }
+
+  // ── 页面用的只读视图 ────────────────────────────────────────────────────
+
+  /** 任务清单 + 目录（页面顶部的下拉、时间线都从这里来）。 */
+  async function overview(agent) {
+    const ctx = await ctxFor(agent)
+    return {
+      repo: ctx.repo,
+      jobs: ctx.repo === null ? [] : scanJobs(ctx.jobs),
+    }
+  }
+
+  /** 一个任务的完整视图：状态、阶段链、下一步、在跑进度、产物。 */
+  async function jobView({ job_id }, agent) {
+    const jobId = String(job_id || '').trim()
+    const ctx = await ctxFor(agent)
+    const state = readState(ctx.jobs, jobId)
+    if (!state) throw new JournalError(`找不到任务 ${jobId}（目录 ${ctx.jobs}）`)
+    const status = state.status || 'created'
+    return {
+      job_id: jobId,
+      feature: state.feature,
+      feature_name: state.feature_name || state.feature,
+      status,
+      error: state.error || '',
+      created_at: state.created_at || '',
+      updated_at: state.updated_at || '',
+      input: state.input || {},
+      options: state.options || {},
+      stages: stageRows(state),
+      running: runner.snapshot(jobId),
+      // 状态说还在跑、后台却没有这个进程：进程被杀了，或者插件重启过。
+      // 不说清楚的话页面会一直转"正在跑"，中止按钮也没地方按。
+      stalled: status === 'running' && !runner.isRunning(jobId),
+      files: listFiles(state, ctx.jobs),
+    }
+  }
+
+  /** 某个 AI 阶段的待办面（分页 + 已交结论 + 列定义所需的一切）。 */
+  async function reviewView({ job_id, stage, offset = 0, limit = 200, q = '' }, agent) {
+    const jobId = String(job_id || '').trim()
+    const ctx = await ctxFor(agent)
+    const state = readState(ctx.jobs, jobId)
+    const sid = String(stage || '').trim() || awaitingStage(state)
+    if (!sid) return { job_id: jobId, stage: null, total: 0, items: [], value_enum: [], submitted: {} }
+
+    const doc = readRequest(ctx.jobs, jobId, sid)
+    if (!doc) throw new JournalError(`阶段 ${sid} 还没有待办（没跑到，或已提交完）`)
+
+    const submitted = readDecisions(ctx.jobs, jobId, sid)
+    let items = Array.isArray(doc.items) ? doc.items : []
+    const needle = String(q || '').trim().toLowerCase()
+    if (needle) {
+      items = items.filter((item) => Object.values(item || {})
+        .some((value) => String(value ?? '').toLowerCase().includes(needle)))
+    }
+    const total = items.length
+    const from = Math.max(0, Math.floor(Number(offset) || 0))
+    const size = Math.min(500, Math.max(1, Math.floor(Number(limit) || 200)))
+    return {
+      job_id: jobId,
+      stage: sid,
+      title: state?.stages?.[sid]?.title || sid,
+      help: doc.help || '',
+      key_name: doc.key_name || 'key',
+      value_enum: Array.isArray(doc.value_enum) ? doc.value_enum : [],
+      truncated: Boolean(doc.truncated),
+      total,
+      offset: from,
+      limit: size,
+      items: items.slice(from, from + size),
+      submitted,
+    }
+  }
+
+  /** 恢复/续跑（页面上的"重试"按钮）。 */
+  async function resume({ job_id }, agent) {
+    const jobId = String(job_id || '').trim()
+    const ctx = await ctxFor(agent)
+    if (isBusy(jobId, readState(ctx.jobs, jobId))) {
+      throw new JournalError('任务已经在跑了。')
+    }
+    notifier?.remember(jobId, agent)
+    notifier?.touch(jobId, 'drive')
+    startBackground(ctx, jobId, '续跑')
+    return { ok: true, job_id: jobId }
+  }
+
+  /**
+   * 中止（页面上的「■ 中止」）。
+   *
+   * 顺序不能反：**先杀进程，再写状态**。先写状态的话，还在跑的 python 会把
+   * state.json 又盖回 running——页面上就是"点了中止没反应"。
+   *
+   * 状态是 `aborted` 而不是 `failed`：这是人按的停止，不是算错了。重试走 resume，
+   * 已完成的阶段按哈希跳过，不会从头再来。
+   */
+  async function stop({ job_id }, agent) {
+    const jobId = String(job_id || '').trim()
+    if (!jobId) throw new JournalError('要给 job_id。')
+    const ctx = await ctxFor(agent)
+    const killed = runner.stop(jobId)
+    if (killed) await runner.settled(jobId, 10_000)
+    const value = await call(ctx, ['abort', jobId])
+    notifier?.touch(jobId, 'stop')
+    return value
+  }
+
+  /**
+   * 现在就叫醒 agent（页面上的「叫 AI 复核」）。
+   *
+   * 自动唤醒是"跑完才叫"，这里允许人在任务停着的时候手动叫一次——比如你刚关掉
+   * 自动唤醒，或者上一个会话的 agent 已经被别的事占住。
+   */
+  async function wake({ job_id }, agent) {
+    const jobId = String(job_id || '').trim()
+    if (!jobId) throw new JournalError('要给 job_id。')
+    const ctx = await ctxFor(agent)
+    notifier?.remember(jobId, agent)
+    const key = await notifier?.notify({ jobId, repo: ctx.repo }, { force: true })
+    return key
+      ? { ok: true, woken: true, job_id: jobId }
+      : { ok: true, woken: false, job_id: jobId }
+  }
+
+  // ── 结果 ────────────────────────────────────────────────────────────────
+
+  async function report({ job_id }, agent) {
+    const jobId = String(job_id || '').trim()
+    if (!jobId) throw new JournalError('要给 job_id。')
+    const ctx = await ctxFor(agent)
+    const value = await call(ctx, ['report', jobId])
+    return clamp(formatReport(value))
+  }
+
+  /** 功能清单原文（页面用它画功能卡与阶段链）。 */
+  async function featuresRaw(agent) {
+    const ctx = await ctxFor(agent)
+    const cached = featureCache.get(ctx.repo)
+    if (cached && Date.now() - cached.at < FEATURES_TTL_MS) return cached.value
+    const value = await call(ctx, ['features'])
+    featureCache.set(ctx.repo, { at: Date.now(), value })
+    return value
+  }
+
+  /** 下载白名单：只有 state 里登记过的产物才给。（页面用） */
+  async function resolveDownload({ job_id, key }, agent) {
+    const jobId = String(job_id || '').trim()
+    const ctx = await ctxFor(agent)
+    const state = readState(ctx.jobs, jobId)
+    if (!state) throw new JournalError(`找不到任务 ${jobId}`)
+    const files = listFiles(state, ctx.jobs)
+    const hit = files.find((item) => item.key === key)
+    if (!hit) throw new JournalError(`没有产物 ${key}（任务状态 ${state.status}）`)
+    return { path: hit.path, filename: hit.filename }
+  }
+
+  return {
+    features, featuresRaw, inspect, inspectRaw, start, startRaw,
+    next, submit, submitRaw, report,
+    overview, jobView, reviewView, resume, stop, wake, resolveDownload,
+  }
+}
+
+function awaitingStage(state) {
+  const stages = state?.stages || {}
+  return Object.keys(stages).find((id) => stages[id]?.status === 'awaiting') || ''
+}
+
+function resolveInput(file, repo) {
+  const raw = String(file || '').trim()
+  if (!raw) throw new JournalError('没给文件路径。')
+  return isAbsolute(raw) ? raw : resolve(repo, raw)
+}
+
+const sleep = (ms) => new Promise((done) => {
+  const timer = setTimeout(done, ms)
+  timer.unref?.()
+})
+
+/**
+ * 等任务推进一格。
+ *
+ * 进度的最小单位是**阶段**：`jobflow` 每跑完一个阶段才写一次 state.json，
+ * 所以"阶段的条数或总状态变了"就等于"真的往前走了"。不满足就一直等到预算用完，
+ * 调用方再拿 stderr 尾巴告诉人跑到了哪。
+ */
+async function waitForProgress(jobsDir, jobId, runner, budgetMs) {
+  const signature = (state) => `${state?.status || ''}#${Object.keys(state?.stages || {}).length}`
+  const before = signature(readState(jobsDir, jobId))
+  const deadline = Date.now() + budgetMs
+  while (Date.now() < deadline && runner.isRunning(jobId)) {
+    await sleep(POLL_MS)
+    if (signature(readState(jobsDir, jobId)) !== before) return
+  }
+}
+
+/** 只保留"有值"的映射：空串等于没指定，传给阶段反而会报"表里没有这一列"。 */
+function normalizeMapping(mapping) {
+  if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) return null
+  const out = {}
+  for (const [key, value] of Object.entries(mapping)) {
+    const column = typeof value === 'string' ? value.trim() : ''
+    if (column) out[String(key)] = column
+  }
+  return Object.keys(out).length ? out : null
+}
+
+function writeDecisionFile({ stage, decisions }) {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-journal-'))
+  const file = join(dir, 'decisions.json')
+  const doc = {
+    schema_version: 1,
+    stage: stage || '',
+    decisions: decisions.map((item) => ({
+      key: String(item?.key ?? ''),
+      value: String(item?.value ?? ''),
+      note: String(item?.note ?? ''),
+    })),
+    by: 'ai',
+  }
+  writeFileSync(file, JSON.stringify(doc, null, 2), 'utf8')
+  return { file, dir }
+}

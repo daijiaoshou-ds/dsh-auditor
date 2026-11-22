@@ -1,0 +1,19 @@
+# 审计工作台（dsh-auditor）—— bundle patch
+#
+# 插件自带 Python 引擎；第一次运行会复制到用户数据目录，venv 与模型都装在那，
+# 升级插件不会把环境冲掉。装好后在页面上点「环境配置」走六步即可。
+#
+# 可选配置（都不给也能跑）：
+#   - insert:
+#       - id: dsh-auditor
+#         name: dsh-auditor
+#         config:
+#           repoRoot: D:\path\to\engine        # 想用自己那份引擎时指过去
+#           python: D:\path\to\venv\Scripts\python.exe
+#           jobsDir: D:\path\to\_storage_jobs
+#           reviewLimit: 20
+#           autoWake: false
+#
+- insert:
+    - id: dsh-auditor
+      name: dsh-auditor

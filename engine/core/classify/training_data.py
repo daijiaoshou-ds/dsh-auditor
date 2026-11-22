@@ -1,0 +1,1186 @@
+# -*- coding: utf-8 -*-
+"""
+训练数据文件管理 — V3.0（BGE 微调）专用 buckets_v2 格式
+
+**为什么在 `core/classify` 而不在 `tools/train`**：这个模块两边都用——跑账时
+（`SUMMARY_CLEANER_EXPORT_TRAINING=1`）要把本次分类结果导出成未审训练数据，
+重训时又要读它合并/索引。分层规则是"只有重训时才跑的 → `tools/train`"，
+它不满足，所以在内核里；`tools/train/train_v10.py` 反过来 import 它。
+
+设计原则:
+  - V2.1 classify() 每次跑完自动生成 training/{hash}.json（buckets_v2 格式）
+  - 按桶聚合: 桶 → 科目组合 → 摘要列表，方便 AI 按桶审核（只删不改）
+  - 人工审核后（reviewed: true）→ 合并为 training_data.json → 训练
+  - 训练时展开为扁平 records
+
+文件体系:
+  nn/_storage/
+  ├── training/                  ← 按哈希分离的"生"训练数据（需人工审核）
+  │   ├── {hash1}.json           ← buckets_v2 格式
+  │   └── {hash2}.json
+  ├── training_data.json          ← 合并后的训练数据（仅从已审核的哈希文件合并）
+  ├── fine_tuned/                 ← [训练产物] 微调后 BGE 模型
+  ├── finance_classifier.pt       ← [训练产物] 分类头
+  ├── subject_to_index.json       ← [训练产物] 科目开关索引
+  ├── index_to_bucket.json        ← [训练产物] 桶索引
+  └── training_log.json           ← [训练产物] 训练日志
+
+单哈希文件格式 (buckets_v2):
+  {
+    "fingerprint": "abc123",
+    "created_at": "2025-07-25",
+    "format": "buckets_v2",
+    "reviewed": false,
+    "stats": {"total_records": 10, "buckets": 3, "dedup_merged": 2, "conflicts": 0},
+    "buckets": {
+      "存货采购": [
+        {
+          "subjects": ["应付账款[借]", "银行存款[贷]"],
+          "records": [
+            {"summary": "付杭州分公司货款", "count": 3},
+            {"summary": "付北京分公司货款", "count": 5}
+          ]
+        }
+      ],
+      "日常费用": [ ... ]
+    }
+  }
+
+审核方式（AI/人工）: 一个桶一个桶看。桶下每个「科目组合」节点及其摘要列表
+若不属于该桶 → 直接删除该节点（或删除其中部分摘要）。不修改桶名、不新增记录。
+删除后剩下的记录天然属于该桶，训练时展开即可。
+
+旧格式（records_v1，扁平记录）文件会被 merge 自动跳过。
+本模块顶层禁止 import torch/transformers —— V2.1 的 classify() 直接引用本模块。
+"""
+
+import difflib
+import json
+import os
+import random
+import re
+import shutil
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import pandas as pd
+
+# 当前训练数据格式版本（buckets_v2: 按桶聚合，AI 按桶审核）
+RECORDS_FORMAT = "buckets_v2"
+
+# count 展开上限（防单条重复样本膨胀失控）
+MAX_COUNT_EXPAND = 20
+
+# 单桶训练样本上限（有效样本口径）。销售/采购两个桶占总量的 56%，
+# 会把模型先验拉向它们。超限按 cap/实际 等比缩放展开次数——记录一条不删，
+# 只降重复度。取 12,000 而不是 8,000：砍太狠会削薄"负样本空间"，
+# 而 销售↔结算手续费、采购↔费用的混淆恰恰靠它压住。
+BUCKET_EFFECTIVE_CAP = 12000
+
+
+def atomic_write_json(path: Path, data: dict):
+    """写 JSON（.tmp + fsync + 原子替换），进程崩溃/断电时不会留下半截文件。
+
+    与 v2/storage_utils.safe_write_json 的区别：不带备份轮转（备份目录
+    属于 v2 存储），只保证写入原子性——nn 训练数据文件大且频繁重写。
+
+    2026-08-15 断电事故后补充：.tmp + replace 只防进程崩溃；断电时
+    OS 写缓存未落盘，replace 后的正式文件仍可能变成全 0。必须先 fsync
+    把数据写穿到磁盘，再 replace。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2))
+        f.flush()
+        os.fsync(f.fileno())   # 写穿到磁盘，防断电后正式文件变全 0
+    try:
+        tmp.replace(path)
+    except OSError:
+        print(f"[WARN] 原子替换失败: {path}（数据完整保留在 {tmp}，请人工处理）")
+
+
+# ============================================================================
+# 构建单哈希训练数据（records_v1）
+# ============================================================================
+
+def _dedup_key(summary: str, subjects: List[str]) -> Tuple[str, str]:
+    """去重键: (摘要, 排序后的科目组合)。"""
+    return summary, "|".join(sorted(subjects))
+
+
+# ── 复核明细聚合（v10.1 模型能力体检）──
+# 导出本来就是按「摘要 + 科目组合」聚合的，凭证号会被丢掉。因此置信度
+# 不能逐条存，而要聚合成分布；同一 key 被判到不同桶（conflicts）是最有
+# 价值的错因信号，必须保留而不是抹掉。
+
+def _conf_level(prob_cal) -> str:
+    """校准后概率 → 置信度档（与 classifier 的 _confidence_level 一致）。"""
+    if prob_cal is None:
+        return "未知"
+    if prob_cal >= 0.8:
+        return "高"
+    if prob_cal >= 0.5:
+        return "中"
+    return "低"
+
+
+def _summarize_preds(preds: List[Dict], bucket_votes: Dict[str, int]) -> Dict:
+    """把同一 (摘要, 科目组合) 下所有凭证的判定聚合成一条复核信息。"""
+    valid = [p for p in preds if p]
+    raws = [p["prob_raw"] for p in valid if p.get("prob_raw") is not None]
+    cals = [p["prob_cal"] for p in valid if p.get("prob_cal") is not None]
+    conf_dist: Dict[str, int] = {}
+    sources: Dict[str, int] = {}
+    for p in valid:
+        lvl = _conf_level(p.get("prob_cal"))
+        conf_dist[lvl] = conf_dist.get(lvl, 0) + 1
+        s = p.get("source") or "未知"
+        sources[s] = sources.get(s, 0) + 1
+    return {
+        "n": len(preds),
+        "prob_raw_mean": round(sum(raws) / len(raws), 4) if raws else None,
+        "prob_raw_min": round(min(raws), 4) if raws else None,
+        "prob_raw_max": round(max(raws), 4) if raws else None,
+        "prob_cal_mean": round(sum(cals) / len(cals), 4) if cals else None,
+        "prob_cal_min": round(min(cals), 4) if cals else None,
+        "prob_cal_max": round(max(cals), 4) if cals else None,
+        "conf_dist": conf_dist,
+        "bucket_votes": dict(bucket_votes),
+        "conflicts": len(bucket_votes) > 1,
+        "top3_sample": (valid[0].get("top3") or []) if valid else [],
+        "sources": sources,
+    }
+
+
+def _merge_pred(a: Dict, b: Dict) -> Dict:
+    """相似摘要合并时，把两条复核信息并成一条。"""
+    if not a:
+        return dict(b or {})
+    if not b:
+        return dict(a)
+    out = dict(a)
+    for k in ("conf_dist", "sources", "bucket_votes"):
+        merged = dict(a.get(k) or {})
+        for key, val in (b.get(k) or {}).items():
+            merged[key] = merged.get(key, 0) + val
+        out[k] = merged
+    out["conflicts"] = out["conflicts"] or bool(b.get("conflicts")) or len(out["bucket_votes"]) > 1
+    for k, fn in (("prob_raw_min", min), ("prob_cal_min", min),
+                  ("prob_raw_max", max), ("prob_cal_max", max),
+                  ("prob_raw_mean", lambda x, y: (x + y) / 2),
+                  ("prob_cal_mean", lambda x, y: (x + y) / 2)):
+        av, bv = a.get(k), b.get(k)
+        if av is not None and bv is not None:
+            out[k] = round(fn(av, bv), 4)
+        elif bv is not None:
+            out[k] = bv
+    out["n"] = (a.get("n") or 0) + (b.get("n") or 0)
+    return out
+
+
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _normalize_summary(text: str) -> str:
+    """摘要归一化: 数字 → '#' 占位符。
+
+    目的: 相似度计算时忽略数字（日期/凭证号/金额对分类无意义）。
+    '暂估计提2024年12月份厂房电费' 与 '暂估计提2025年1月份厂房电费'
+    归一化后完全相同 → 相似度 100% → 正确合并（同一业务）。
+    实测: 原始相似度 35% → 归一化后 95%+。
+    """
+    return _DIGITS_RE.sub("#", text)
+
+
+def _dedupe_similar_summaries(
+    buckets_data: Dict[str, List[Dict]],
+    threshold: float = 0.75,
+) -> Dict[str, List[Dict]]:
+    """同桶同科目组合内，摘要文本相似度 ≥ threshold 的只保留 1 条（count 累加）。
+
+    背景: 序时账里"计提...25年1月 / 25年2月 / 25年3月..."这类只差期间的
+    摘要语义完全相同，AI 审核时逐个看浪费上下文且稀释注意力。
+    相似摘要 BGE 编码后向量几乎相同，去重对训练效果影响极小，count 累加
+    保留训练权重。
+
+    相似度: 数字归一化（_normalize_summary）后 difflib 字符级 ratio——
+    日期/凭证号/金额等数字对分类无意义，忽略后才能反映真实业务相似度。
+    保留策略: 保留 count 最大的，其余 count 累加进它（保持总权重不变）。
+
+    Args:
+        buckets_data: buckets_v2 聚合格式 {桶: [{subjects, records}]}
+        threshold: 相似度阈值（默认 0.75 = 75%）
+
+    Returns:
+        去重后的 buckets_data（就地修改）
+    """
+    for groups in buckets_data.values():
+        for group in groups:
+            recs = group.get("records", [])
+            if len(recs) <= 1:
+                continue
+            # count 降序，先处理高频（高频胜出）
+            recs = sorted(recs, key=lambda r: -r.get("count", 1))
+            kept: List[Dict] = []
+            kept_norms: List[str] = []
+            for rec in recs:
+                norm_rec = _normalize_summary(rec["summary"])
+                merged = False
+                for k, norm_kept in zip(kept, kept_norms):
+                    # 三级预筛，都是 ratio() 的数学上界，不改变最终判定：
+                    # ① 长度：比值 >1.7 时 ratio 上限 2·min/(len1+len2) < 0.75
+                    # ② real_quick_ratio：字符总长的 O(n) 上界
+                    # ③ quick_ratio：字符计数交集的 O(n) 上界
+                    # 大账（14 万条记录）上原本每对都跑完整 LCS，实测占掉
+                    # pipeline 近 8 成时间；加预筛后判定结果逐条相同。
+                    _lo, _hi = (len(norm_rec), len(norm_kept))
+                    if _lo > _hi:
+                        _lo, _hi = _hi, _lo
+                    if _hi - _lo > 0.7 * _lo:
+                        continue
+                    _sm = difflib.SequenceMatcher(None, norm_rec, norm_kept)
+                    if _sm.real_quick_ratio() < threshold:
+                        continue
+                    if _sm.quick_ratio() < threshold:
+                        continue
+                    sim = _sm.ratio()
+                    if sim >= threshold:
+                        k["count"] = k.get("count", 1) + rec.get("count", 1)
+                        # 只有复核明细存在时才合并；金标准/旧文件不带 pred，
+                        # 不能在合并时给它们凭空加上空字段
+                        if k.get("pred") or rec.get("pred"):
+                            k["pred"] = _merge_pred(
+                                k.get("pred") or {}, rec.get("pred") or {}
+                            )
+                        merged = True
+                        break
+                if not merged:
+                    kept.append(dict(rec))
+                    kept_norms.append(norm_rec)
+            group["records"] = sorted(kept, key=lambda r: -r.get("count", 1))
+    return buckets_data
+
+
+def _aggregate_by_bucket(records: List[Dict]) -> Dict[str, List[Dict]]:
+    """扁平 records → 按桶聚合: {桶: [{subjects, records: [{summary, count}]}]}。
+
+    桶下按科目组合分组，同组合的摘要合并为列表（AI 按桶审核友好）。
+    """
+    buckets: Dict[str, Dict[str, Dict]] = {}
+    for rec in records:
+        subj_key = "|".join(sorted(rec["subjects"]))
+        bucket_groups = buckets.setdefault(rec["bucket"], {})
+        group = bucket_groups.setdefault(subj_key, {
+            "subjects": rec["subjects"],
+            "records": [],
+        })
+        item = {
+            "summary": rec["summary"],
+            "count": rec.get("count", 1),
+        }
+        # 复核明细只出现在未审文件里；金标准合并时 records 无 pred，
+        # 不加空字段以保持金标准格式干净
+        if rec.get("pred"):
+            item["pred"] = rec["pred"]
+        group["records"].append(item)
+
+    # 桶内按科目组合排序；组合内按 count 降序（高频优先）
+    result: Dict[str, List[Dict]] = {}
+    for bucket, groups in buckets.items():
+        result[bucket] = sorted(
+            groups.values(),
+            key=lambda g: -sum(r["count"] for r in g["records"]),
+        )
+    return result
+
+
+def build_hash_training_data(
+    df: pd.DataFrame,
+    column_mapping: Dict[str, str],
+    fingerprint: str = "",
+    output_dir: str = None,
+    skip_buckets: Optional[Set[str]] = None,
+    skip_voucher_ids: Optional[Set[str]] = None,
+    features: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """从 V2.1 分类结果提取训练记录 → 去重 → 按桶聚合 → 写入未审目录。
+
+    返回数据 dict（同时写盘 training/unreviewed/{fingerprint}.json）。
+
+    skip_voucher_ids: 按凭证号跳过的集合（字符串）。classify() 用它排除
+    「期末结转」等 Step 0 机械预分配凭证——它们桶标签是"其他业务"但无
+    业务含义，混入训练会稀释"其他业务"的语义样本（营业外/捐赠/罚款等）。
+    """
+    from core.nn.data import DEFAULT_SKIP_BUCKETS, extract_training_records
+
+    if output_dir is None:
+        from core.classify.config import NN_STORAGE_DIR
+        output_dir = str(Path(NN_STORAGE_DIR) / "training" / "unreviewed")
+
+    # 提取 [摘要, 科目组合, 桶] 训练记录
+    raw_records = extract_training_records(
+        df, column_mapping, skip_buckets=skip_buckets or DEFAULT_SKIP_BUCKETS,
+        skip_voucher_ids=skip_voucher_ids, features=features,
+    )
+
+    # ── 文件内去重: 同键同桶 count 累加；同键不同桶 → 分桶计数众数胜出 ──
+    # count 语义: 只计胜出桶的次数。旧实现把败方桶的出现次数也累进
+    # 胜方 count（5 次 A + 3 次 B → A 的 count=8），展开训练时错误
+    # 放大胜方权重。
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    dedup_merged = 0
+    conflicts = 0
+
+    for rec in raw_records:
+        key = _dedup_key(rec["summary"], rec["subjects"])
+        if key in merged:
+            dedup_merged += 1
+            existing = merged[key]
+            existing["buckets"][rec["bucket"]] = (
+                existing["buckets"].get(rec["bucket"], 0) + 1
+            )
+            existing["preds"].append(rec.get("pred") or {})
+            if rec["bucket"] != existing["bucket"]:
+                conflicts += 1
+                # 冲突: 分桶计数众数裁决
+                winner, _ = max(existing["buckets"].items(), key=lambda kv: kv[1])
+                existing["bucket"] = winner
+        else:
+            merged[key] = {
+                "summary": rec["summary"],
+                "subjects": rec["subjects"],
+                "bucket": rec["bucket"],
+                "buckets": {rec["bucket"]: 1},
+                "preds": [rec.get("pred") or {}],
+            }
+
+    records = [
+        {
+            "summary": e["summary"],
+            "subjects": e["subjects"],
+            "bucket": e["bucket"],
+            "count": e["buckets"][e["bucket"]],
+            "pred": _summarize_preds(e["preds"], e["buckets"]),
+        }
+        for e in merged.values()
+    ]
+    records.sort(key=lambda r: (r["bucket"], r["summary"]))
+
+    # 按桶聚合 + 相似摘要去重（同桶同组合 >75% 只留 1，count 累加）
+    buckets_data = _aggregate_by_bucket(records)
+    _dedupe_similar_summaries(buckets_data)
+
+    # 去重后的实际摘要数（stats 用）
+    deduped_records = _flatten_buckets(buckets_data)
+    data = {
+        "fingerprint": fingerprint or "unknown",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "format": RECORDS_FORMAT,
+        "reviewed": False,
+        "stats": {
+            "total_records": len(deduped_records),
+            "raw_records": len(records),
+            "buckets": len(buckets_data),
+            "dedup_merged": dedup_merged,
+            "sim_deduped": len(records) - len(deduped_records),
+            "conflicts": conflicts,
+        },
+        "buckets": buckets_data,
+    }
+
+    # 写入文件
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{fingerprint or 'unknown'}.json"
+
+    # 防覆盖已审/已拆分文件：同哈希重跑分类会重新导出，直接覆盖会把
+    # 审核删样本的成果与 confidence 标记抹掉——覆盖前先备份旧版本
+    # （修复前重跑分类静默覆盖，reviewed 状态与拆出的 low 记录全部丢失）
+    if path.exists():
+        try:
+            old = json.loads(path.read_text(encoding="utf-8"))
+            if old.get("reviewed") or (old.get("stats") or {}).get("confidence_split"):
+                backup_dir = output_dir.parent / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup = backup_dir / f"{path.stem}.reviewed-{ts}.json"
+                shutil.copy2(path, backup)
+                print(f"[WARN] 目标文件已审核/已拆分，旧版本已备份到: {backup}")
+        except (json.JSONDecodeError, KeyError, OSError):
+            pass
+
+    atomic_write_json(path, data)
+
+    print(f"[OK] 训练数据已保存: {path}")
+    print(f"   {len(deduped_records)} 条记录（相似去重 {len(records) - len(deduped_records)} 条）, "
+          f"{len(buckets_data)} 桶, 精确去重 {dedup_merged} 条, 冲突 {conflicts} 条")
+
+    return data
+
+
+# ============================================================================
+# 合并所有已审核的哈希文件
+# ============================================================================
+
+def _merge_rec(
+    merged: Dict[Tuple[str, str], Dict[str, Any]],
+    summary: str,
+    subjects: List[str],
+    bucket: str,
+    count: int,
+):
+    """合并一条记录进跨文件 dict（同键同桶累加；不同桶记入候选，最终众数裁决）。"""
+    key = _dedup_key(summary, subjects)
+    if key in merged:
+        entry = merged[key]
+        entry["buckets"][bucket] = entry["buckets"].get(bucket, 0) + count
+        entry["total"] = entry.get("total", 0) + count
+    else:
+        merged[key] = {
+            "summary": summary,
+            "subjects": subjects,
+            "buckets": {bucket: count},
+            "total": count,
+        }
+
+
+def merge_training_data(
+    training_dir: str = None,
+    only_reviewed: bool = True,
+    output_path: str = None,
+) -> Dict[str, Any]:
+    """合并已审核的未审文件进金标准 training_data.json（幂等，合并后删除文件）。
+
+    新设计（用户确认的文件结构）:
+      - 只有未审目录 training/unreviewed/（哈希命名，V2.1 自动生成）
+      - 已审数据（AI 审完标 reviewed 的 + 置信度 high 自动并入的）**直接合并进
+        training_data.json**，合并后从未审目录删除文件 —— 不保留已审文件副本，
+        training_data.json 是唯一已审金标准，持续扩大
+      - 已合并过的哈希（金标准 source_hashes 中已存在）跳过并删除，保证幂等
+
+    跨文件去重: 同键同桶 count 累加；同键不同桶 → count 加权众数胜出。
+
+    Args:
+        training_dir: 未审目录（默认 nn/_storage/training/unreviewed/）
+        only_reviewed: True = 只合并 reviewed: true 的文件
+        output_path: 金标准输出（默认 nn/_storage/training_data.json）
+
+    Returns:
+        金标准数据 dict
+    """
+    if training_dir is None:
+        from core.classify.config import NN_STORAGE_DIR
+        training_dir = str(Path(NN_STORAGE_DIR) / "training" / "unreviewed")
+    if output_path is None:
+        from core.classify.config import NN_STORAGE_DIR
+        output_path = str(Path(NN_STORAGE_DIR) / "training_data.json")
+
+    training_dir = Path(training_dir)
+    if not training_dir.exists():
+        print(f"[WARN] 未审目录不存在: {training_dir}")
+        return {"records": [], "source_hashes": []}
+
+    # 金标准已有来源（幂等去重用）
+    existing_hashes: Set[str] = set()
+    if Path(output_path).exists():
+        try:
+            old = json.loads(Path(output_path).read_text(encoding="utf-8"))
+            for h in old.get("source_hashes", []):
+                existing_hashes.add(str(h))
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # 跨文件合并: 同键 → {桶: count} 字典，最终按 count 加权众数裁决
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    source_hashes = []
+    skipped_unreviewed = 0
+    skipped_legacy = 0
+    skipped_consumed = 0
+    conflicts = 0
+    consumed_files = []
+
+    for f in sorted(training_dir.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, KeyError):
+            skipped_legacy += 1
+            continue
+
+        if "buckets" not in data:
+            skipped_legacy += 1
+            continue
+
+        fingerprint = data.get("fingerprint", f.stem)
+
+        # 幂等: 已并入过金标准的文件不再重复并入（同键 count 会翻倍）。
+        # 但不静默删除：同哈希重导出的文件可能带了融合/纠错升级后的
+        # 新分类，直接删掉会丢改进线索 → 移入 consumed/ 保留最新副本，
+        # 供人工比对后决定是否处理。
+        if fingerprint in existing_hashes:
+            consumed_dir = training_dir.parent / "consumed"
+            consumed_dir.mkdir(parents=True, exist_ok=True)
+            f.replace(consumed_dir / f.name)
+            skipped_consumed += 1
+            consumed_files.append(f.name)
+            print(f"   [SKIP] 已并入过金标准，移入 consumed/: {f.name}")
+            continue
+
+        if only_reviewed and not data.get("reviewed", False):
+            skipped_unreviewed += 1
+            continue
+
+        source_hashes.append(fingerprint)
+        for rec in _flatten_buckets(data["buckets"]):
+            _merge_rec(merged, rec["summary"], rec["subjects"], rec["bucket"],
+                       rec.get("count", 1))
+
+        # 合并后消费: 删除已并入的未审文件（金标准已是唯一已审存储）
+        f.unlink()
+        consumed_files.append(f.name)
+
+    # 与现有金标准合并（同键 count 累加）——必须在 records 构建之前！
+    # 否则旧金标准数据不会被写入输出（上次 bug: 金标准被空数据覆盖）
+    if Path(output_path).exists():
+        try:
+            old = json.loads(Path(output_path).read_text(encoding="utf-8"))
+            for rec in _flatten_buckets(old.get("buckets", {})):
+                _merge_rec(merged, rec["summary"], rec["subjects"], rec["bucket"],
+                           rec.get("count", 1))
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # 冲突裁决: count 加权众数
+    conflict_stats = {"total_conflicts": 0, "resolved_by_majority": 0}
+    records = []
+    for key, entry in merged.items():
+        bucket, count = max(entry["buckets"].items(), key=lambda kv: kv[1])
+        if len(entry["buckets"]) > 1:
+            conflict_stats["total_conflicts"] += 1
+            if entry["buckets"][bucket] >= entry["total"] / 2:
+                conflict_stats["resolved_by_majority"] += 1
+        records.append({
+            "summary": entry["summary"],
+            "subjects": entry["subjects"],
+            "bucket": bucket,
+            "count": count,
+        })
+
+    records.sort(key=lambda r: (r["bucket"], r["summary"]))
+
+    # 按桶聚合 + 相似摘要去重
+    buckets_data = _aggregate_by_bucket(records)
+    _dedupe_similar_summaries(buckets_data)
+    deduped = _flatten_buckets(buckets_data)
+    buckets = sorted({r["bucket"] for r in deduped})
+
+    # source_hashes = 历史全部来源（含已消费的）
+    all_hashes = sorted(existing_hashes | set(source_hashes))
+
+    merged_data = {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "format": RECORDS_FORMAT,
+        "source_hashes": all_hashes,
+        "total_hashes": len(all_hashes),
+        "skipped_unreviewed": skipped_unreviewed,
+        "skipped_legacy_format": skipped_legacy,
+        "skipped_consumed": skipped_consumed,
+        "conflict_stats": conflict_stats,
+        "stats": {
+            "total_records": len(deduped),
+            "raw_records": len(records),
+            "buckets": len(buckets),
+            "sim_deduped": len(records) - len(deduped),
+        },
+        "buckets": buckets_data,
+    }
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(Path(output_path), merged_data)
+
+    print(f"[OK] 已合并进金标准: {output_path}")
+    print(f"   本次并入 {len(source_hashes)} 份文件, 删除 {len(consumed_files)} 份已消费文件")
+    print(f"   金标准累计: {len(deduped)} 条记录, {len(buckets)} 桶, {len(all_hashes)} 份来源")
+    if skipped_unreviewed:
+        print(f"   跳过 {skipped_unreviewed} 个未审核文件")
+    if skipped_consumed:
+        print(f"   {skipped_consumed} 个同指纹重导出文件移入 consumed/")
+    if skipped_legacy:
+        print(f"   跳过 {skipped_legacy} 个旧格式文件")
+
+    return merged_data
+
+
+# ============================================================================
+# 加载 / 查看 / 审核
+# ============================================================================
+
+def _flatten_buckets(buckets_data: Dict[str, List[Dict]]) -> List[Dict[str, Any]]:
+    """buckets_v2 聚合格式 → 扁平 records（训练用）。
+
+    桶名在这里按 `assets/bucket_merge.json` 折叠（费用子桶 → 费用）。
+    这是训练/评估唯一的数据入口，折叠放在这里，读取时就已是最终口径，
+    而 training_data.json 里的原始子桶名保持不变（可回滚）。
+    """
+    from core.classify.bucket_merge import fold
+
+    records = []
+    for bucket, groups in buckets_data.items():
+        bucket = fold(bucket)
+        for group in groups:
+            subjects = group.get("subjects", [])
+            for rec in group.get("records", []):
+                records.append({
+                    "summary": rec["summary"],
+                    "subjects": subjects,
+                    "bucket": bucket,
+                    "count": rec.get("count", 1),
+                })
+    return records
+
+
+def load_merged_records(file_path: str = None) -> List[Dict[str, Any]]:
+    """读取合并后的扁平 records 列表（buckets_v2 展开；缺失/旧格式 → []）。"""
+    if file_path is None:
+        from core.classify.config import NN_STORAGE_DIR
+        file_path = str(Path(NN_STORAGE_DIR) / "training_data.json")
+
+    path = Path(file_path)
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+    if "buckets" in data:
+        return _flatten_buckets(data["buckets"])
+    if "records" in data:
+        return data["records"]  # 旧 records_v1 兼容
+    return []
+
+
+def list_training_files(training_dir: str = None) -> List[Dict]:
+    """列出未审目录中所有哈希训练文件及其审核状态（buckets_v2 格式统计）。"""
+    if training_dir is None:
+        from core.classify.config import NN_STORAGE_DIR
+        training_dir = str(Path(NN_STORAGE_DIR) / "training" / "unreviewed")
+
+    training_dir = Path(training_dir)
+    if not training_dir.exists():
+        return []
+
+    files = []
+    for f in sorted(training_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+        buckets_data = data.get("buckets", {})
+        if buckets_data:
+            total_records = sum(
+                len(rec.get("records", []))
+                for groups in buckets_data.values()
+                for rec in groups
+            )
+            files.append({
+                "filename": f.name,
+                "fingerprint": data.get("fingerprint", ""),
+                "reviewed": data.get("reviewed", False),
+                "format": data.get("format", "buckets_v2"),
+                "records": total_records,
+                "buckets": len(buckets_data),
+                "created_at": data.get("created_at", ""),
+                "size_kb": round(f.stat().st_size / 1024, 1),
+            })
+        else:
+            # 旧格式（records_v1 / legacy）: 标记旧格式
+            old_records = data.get("records", [])
+            files.append({
+                "filename": f.name,
+                "fingerprint": data.get("fingerprint", ""),
+                "reviewed": data.get("reviewed", False),
+                "format": data.get("format", "legacy"),
+                "records": len(old_records),
+                "buckets": 0,
+                "created_at": data.get("created_at", ""),
+                "size_kb": round(f.stat().st_size / 1024, 1),
+            })
+
+    return files
+
+
+def mark_reviewed(fingerprint: str, reviewed: bool = True,
+                  training_dir: str = None) -> bool:
+    """标记某哈希文件为已审核/未审核。"""
+    if training_dir is None:
+        from core.classify.config import NN_STORAGE_DIR
+        training_dir = str(Path(NN_STORAGE_DIR) / "training" / "unreviewed")
+
+    path = Path(training_dir) / f"{fingerprint}.json"
+    if not path.exists():
+        print(f"[WARN] 文件不存在: {path}")
+        return False
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["reviewed"] = reviewed
+    data["reviewed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if reviewed else ""
+    atomic_write_json(path, data)
+
+    status = "已审核" if reviewed else "待审核"
+    print(f"[OK] {path.name} → {status}")
+    return True
+
+
+# ============================================================================
+# 索引构建（训练时用）
+# ============================================================================
+
+def build_subject_switch_index(records: List[Dict]) -> Dict[str, int]:
+    """收集全部 '科目[方向]' 开关 → 排序 → {科目[方向]: index}。"""
+    switches: Set[str] = set()
+    for rec in records:
+        switches.update(rec.get("subjects", []))
+    return {s: i for i, s in enumerate(sorted(switches))}
+
+
+def build_bucket_index(records: List[Dict]) -> Dict[str, int]:
+    """收集全部桶 → 排序 → {桶: index}。"""
+    buckets = sorted({rec["bucket"] for rec in records})
+    return {b: i for i, b in enumerate(buckets)}
+
+
+# ============================================================================
+# 训练/验证划分
+# ============================================================================
+
+def split_records(
+    records: List[Dict],
+    train_ratio: float = 0.8,
+    seed: int = 42,
+    bucket_cap: int = None,
+) -> Tuple[List[Dict], List[Dict]]:
+    """按桶分层划分训练/验证集（80/20），count 展开（上限 MAX_COUNT_EXPAND）。
+
+    记录级切分（v2 修复）: 先在记录层面随机划分 80/20，再各自展开——
+    同一记录的全部展开样本必须进同侧。旧版先展开再切，同一记录的
+    展开样本会同时出现在训练集和验证集 → 验证时模型"背过"样本 →
+    val_acc 虚高。
+
+    bucket_cap: 单个桶训练样本的上限（有效样本口径）。超过时按
+        ``cap / 实际`` 等比缩放该桶每条记录的展开次数（随机取整，无偏），
+        **记录本身一条不删**。只作用于训练集——验证集保持真实分布，
+        否则评测指标会被"人为配平"污染。
+
+    Returns:
+        (train_records, val_records) — 展开后的样本列表
+    """
+    # 局部 RNG：全局 random.seed 会污染调用方（训练 shuffle 等）的随机状态
+    rng = random.Random(seed)
+    cap = BUCKET_EFFECTIVE_CAP if bucket_cap is None else bucket_cap
+
+    # 按桶分组
+    by_bucket: Dict[str, List[Dict]] = defaultdict(list)
+    for rec in records:
+        by_bucket[rec["bucket"]].append(rec)
+
+    train_samples: List[Dict] = []
+    val_samples: List[Dict] = []
+    scaled: List[str] = []
+
+    for bucket, bucket_records in by_bucket.items():
+        # 记录级切分（先切记录，再展开）
+        shuffled = list(bucket_records)
+        rng.shuffle(shuffled)
+        n_val_recs = max(1, round(len(shuffled) * (1 - train_ratio))) \
+            if len(shuffled) > 1 else 0
+        val_recs = shuffled[:n_val_recs]
+        train_recs = shuffled[n_val_recs:]
+
+        # 缩放系数按「该桶全量有效样本」算，再只作用于训练侧。
+        # 这样上限的语义是"这个桶最多算 12000 条"，与验证集是否被切走无关；
+        # 验证集保持真实分布，指标才可信。
+        effective = sum(min(r.get("count", 1), MAX_COUNT_EXPAND) for r in bucket_records)
+        factor = 1.0 if (not cap or effective <= cap) else cap / effective
+        if factor < 1.0:
+            scaled.append(f"{bucket}({effective}->{cap})")
+
+        for rec in train_recs:
+            n = min(rec.get("count", 1), MAX_COUNT_EXPAND) * factor
+            k = int(n)
+            if rng.random() < (n - k):      # 随机取整，保持期望等于 n
+                k += 1
+            train_samples.extend([rec] * k)
+        for rec in val_recs:
+            n = min(rec.get("count", 1), MAX_COUNT_EXPAND)
+            val_samples.extend([rec] * n)
+
+    print(f"[OK] 数据划分: 训练 {len(train_samples)} 条, 验证 {len(val_samples)} 条"
+          f"（按桶分层, 记录级切分, 桶数 {len(by_bucket)}）")
+    if scaled:
+        print(f"[OK] 头部等比缩放（记录不删）: {', '.join(scaled)}")
+    return train_samples, val_samples
+
+
+# ============================================================================
+# AI 审核指南生成（供 Claude Code 会话按桶审核用）
+# ============================================================================
+
+# 桶的业务含义（用户编写，供 AI 理解每个桶装什么业务）
+# 注意: 桶名以 BUCKET_REGISTRY 为准（与训练数据一致）
+BUCKET_MEANINGS = {
+    "职工薪酬": "职工薪酬，字面意思，比如发放工资、计提工资等",
+    "税费": "税费，字面意思，比如支付增值税、计提所得税等",
+    "存货采购": "存货采购，字面意思，比如采购原材料、支付供应商货款等",
+    "长期资产": "一切与长期资产相关的活动，比如采购固定资产、装修活动等",
+    "销售收入": "销售收入，字面意思，比如销售货物、收到客户款项等",
+    "借款筹资": "借款筹资，字面意思，比如借款、收到股东注资等",
+    "利息收支": "字面意思，比如支付或计提利息等",
+    "日常费用": "一切与日常费用有关的活动，比如支付办公费、差旅费等",
+    "员工借款": "一切与员工借款有关的活动，比如员工借支、个人暂借款等（备用金垫付仍属日常费用）",
+    "单位往来": "一切与单位之间往来款有关的活动，比如付往来款、暂收暂付款等（兜底桶，排在采购/销售/押金之后）",
+    "押金保证金": "一切与支付押金有关的活动，比如支付租金保证金、投标保证金等",
+    "投资本金": "一切与投资支出有关的活动，比如长期投资等",
+    "分红股利": "字面意思，比如分红",
+    "生产制造": "字面意思，一切与生产制造有关的活动",
+    "折旧摊销": "一切与长期资产折旧摊销有关的活动，比如固定资产折旧、无形资产摊销、使用权资产折旧等",
+    "研发": "一切与研发有关的活动",
+    "政府补助": "一切与政府补助有关的活动",
+    "其他业务": "兜底桶：营业外收支、捐赠、罚款、赔款、资产处置、报废、盘盈盘亏等不属于上述任何桶的业务（期末结转等机械凭证不进入训练数据）",
+}
+
+
+def generate_ai_review_guide(output_path: str = None) -> str:
+    """生成 AI 审核指南（桶定义 + 审核规则）。
+
+    自动排除硬规则桶（资金内部往来/汇兑损益）——它们由 V2.1 代码
+    if 语句写死分配，从不进入训练数据，指南里不应列出（避免 AI 困惑）。
+    "其他业务"是语义兜底桶（营业外/捐赠/罚款等），会出现在训练数据中，
+    保留在指南里（其中期末结转机械凭证已由 classify 侧按凭证号排除）。
+
+    Args:
+        output_path: 输出路径（默认 nn/_storage/training/AI_REVIEW_GUIDE.md）
+
+    Returns:
+        指南文本
+    """
+    from core.classify.config import BUCKET_REGISTRY
+    from core.classify.config import load_buckets_json
+    from core.nn.data import HARD_RULE_BUCKETS
+
+    # 桶关键词资产（含每个桶的关键词列表）
+    kw_data = {}
+    try:
+        kw_data = load_buckets_json()
+    except Exception:
+        kw_data = {}
+
+    lines = []
+    lines.append("# 训练数据 AI 审核指南（buckets_v2）")
+    lines.append("")
+    lines.append("你正在审核「序时账业务分类」训练数据。数据按桶聚合组织，你的任务是：")
+    lines.append("**一个桶一个桶看，发现不属于该桶的记录，直接从桶里删除。**")
+    lines.append("")
+    lines.append("## 文件格式")
+    lines.append("")
+    lines.append("```json")
+    lines.append("{")
+    lines.append('  "fingerprint": "哈希", "reviewed": false,')
+    lines.append('  "buckets": {')
+    lines.append('    "存货采购": [')
+    lines.append("      {")
+    lines.append('        "subjects": ["应付账款[借]", "银行存款[贷]"],   ← 科目组合（借/贷）')
+    lines.append('        "records": [')
+    lines.append('          {"summary": "付杭州分公司货款", "count": 3, "confidence": "high"},')
+    lines.append('          {"summary": "付北京分公司货款", "count": 5, "confidence": "low"}')
+    lines.append("        ]")
+    lines.append("      }")
+    lines.append("    ]")
+    lines.append("  }")
+    lines.append("}")
+    lines.append("```")
+    lines.append("")
+    lines.append("- **buckets** = 按桶聚合。每个桶下是一组「科目组合节点」")
+    lines.append("- **subjects** = 该组合的科目+方向（如 应付账款[借]、银行存款[贷]）——业务结构线索")
+    lines.append("- **records** = 该科目组合下的摘要列表（整句，最重要线索），count = 出现次数（高频更该审准）")
+    lines.append("- **confidence** = 置信度标记（可选）：high = 与金标准一致不用细看；low = 重点审")
+    lines.append("")
+    lines.append("## 置信度拆分（重要）")
+    lines.append("")
+    lines.append("置信度比对程序会把与已审核金标准高度一致的记录")
+    lines.append("（同科目组合 + 同桶 + 摘要相似度≥75%）**自动并入金标准 training_data.json**，")
+    lines.append("**你不需要看它们**，也不会读入你的上下文。")
+    lines.append("")
+    lines.append("主文件（未审目录中的 `{hash}.json`）仅剩低置信度记录，")
+    lines.append("**你审核的就是这份**。记录带 `confidence: \"low\"` 标记（或无标记，按常规审核）。")
+    lines.append("")
+    lines.append("## 审核规则（核心）")
+    lines.append("")
+    lines.append("1. 一次看一个桶。对照下方桶定义，判断桶下每个「科目组合 + 摘要」是否真的属于该桶")
+    lines.append("2. **不属于该桶** → 直接删除：")
+    lines.append("   - 整个科目组合节点都不对 → 删除该组合节点（连同其 records）")
+    lines.append("   - 组合对但个别摘要不对（如混入其他业务）→ 删除该摘要节点")
+    lines.append("3. **拿不准 → 删除**（训练数据宁缺毋滥，只留下最明确、稳健的样本。")
+    lines.append("   存疑样本会教坏模型，宁可少一点数据）")
+    lines.append("4. **只删不改**：不要修改桶名，不要新增记录，不要移动记录到别的桶")
+    lines.append("   - 删除是唯一操作。保留的都是你确认正确的样本")
+    lines.append("5. 审完把该文件的 reviewed 改为 true")
+    lines.append("6. 保留其他所有字段与结构")
+    lines.append("")
+    lines.append("## 桶定义（只会出现在训练数据中的桶）")
+    lines.append("")
+
+    def add_bucket(name):
+        info = BUCKET_REGISTRY.get(name, {})
+        clarity = info.get("clarity", "")
+        subjects = list(info.get("subjects", {}).keys())
+        lines.append(f"### {name}" + (f"（清晰度 {clarity}）" if clarity else ""))
+        meaning = BUCKET_MEANINGS.get(name)
+        if meaning:
+            lines.append(f"- 它的含义：{meaning}")
+        if subjects:
+            lines.append(f"- 主要科目: " + "、".join(subjects[:12]))
+        item = kw_data.get(name)
+        kws = (item or {}).get("keywords", []) if isinstance(item, dict) else (item or [])
+        if kws:
+            lines.append(f"- 关键词: " + "、".join(kws[:15]))
+        lines.append("")
+
+    for name in kw_data:
+        if name not in HARD_RULE_BUCKETS:
+            add_bucket(name)
+    for name in BUCKET_REGISTRY:
+        if name not in kw_data and name not in HARD_RULE_BUCKETS:
+            add_bucket(name)
+
+    guide = "\n".join(lines)
+
+    if output_path is None:
+        from core.classify.config import NN_STORAGE_DIR
+        output_path = str(Path(NN_STORAGE_DIR) / "training" / "AI_REVIEW_GUIDE.md")
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(guide)
+    print(f"[OK] AI 审核指南已生成: {output_path}")
+    return guide
+
+
+# ============================================================================
+# 置信度参考（主动学习）: 未审数据 vs 已审金标准数据
+# ============================================================================
+
+def compute_review_confidence(
+    unreviewed_path: str,
+    golden_records: Optional[List[Dict]] = None,
+    golden_path: Optional[str] = None,
+    threshold: float = 0.75,
+) -> Dict[str, Any]:
+    """将未审数据与已审金标准比对，high 记录直接并入金标准（AI 不读）。
+
+    原理（用户设计的主动学习流程）:
+      - 已审数据 = 金标准（AI + 人工确认过的正确分类，training_data.json）
+      - 新跑的数据若与金标准高度一致 → 分类置信度高 → AI 不用细看
+      - 只把低置信度的给 AI 重点审
+
+    关键设计（避免 high 白占上下文）:
+      high 记录**从主文件物理移出，直接合并进金标准 training_data.json**——
+      AI 审核时只读主文件（仅剩 low 记录），high 完全不进 AI 上下文。
+      不存在 approved 中间文件：只要已审（人工或自动），就进金标准。
+
+    命中条件（全部满足）:
+      1. 科目组合完全相等（subjects 排序后相同）
+      2. 桶完全相等（bucket 相同）
+      3. 摘要文本相似度 >= threshold（difflib 字符级，默认 75%）
+         —— 不同公司基本不会命中，同公司跨年份序时账才可能命中
+
+    文件变化:
+      - 主文件 {hash}.json: 仅保留 low 记录（+ confidence: "low" 标记），供 AI 审核
+      - 金标准 training_data.json: high 记录直接并入（merge 同键 count 累加）
+      - 无金标准时（第一份数据）: 全部 low，仅提示（AI 全审）
+
+    Args:
+        unreviewed_path: 未审训练数据文件路径（buckets_v2 格式）
+        golden_records: 已审金标准扁平记录；None 时自动读
+            nn/_storage/training_data.json
+        golden_path: 金标准文件路径（默认 nn/_storage/training_data.json；
+            high 记录并入写回该文件）。测试/批量处理请显式指定，避免误写
+            真实金标准
+        threshold: 摘要相似度阈值（默认 0.75）
+
+    Returns:
+        {"high": n, "low": m, "high_ratio": x, "golden_source": "..."}
+    """
+    if golden_records is None:
+        from core.classify.config import NN_STORAGE_DIR
+        golden_path = (Path(golden_path) if golden_path
+                       else Path(NN_STORAGE_DIR) / "training_data.json")
+        golden_records = load_merged_records(str(golden_path))
+        golden_source = str(golden_path)
+    else:
+        if golden_path is None:
+            raise ValueError(
+                "传入 golden_records 时必须同时显式传入 golden_path——"
+                "high 记录会写回该文件，缺省写生产 training_data.json "
+                "会污染真实金标准"
+            )
+        golden_path = Path(golden_path)
+        golden_source = "传入记录"
+
+    if not golden_records:
+        print("[WARN] 无已审金标准数据（training_data.json 为空），"
+              "全部标为 low。请先审核一份数据并合并。")
+        golden_source = "空"
+
+    # 金标准索引: (bucket, 科目组合键) → [摘要列表]
+    # 科目组合键 = 排序后的科目开关字符串（不含摘要文本）
+    golden_index: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for rec in golden_records:
+        subj_key = "|".join(sorted(rec.get("subjects", [])))
+        golden_index[(rec["bucket"], subj_key)].append(rec["summary"])
+
+    unreviewed_path = Path(unreviewed_path)
+    data = json.loads(unreviewed_path.read_text(encoding="utf-8"))
+    if "buckets" not in data:
+        raise ValueError(f"不是 buckets_v2 格式: {unreviewed_path}")
+
+    high = 0
+    low = 0
+    total = 0
+
+    # 拆分后的主文件 buckets（只留 low）与 approved buckets（high）
+    low_buckets: Dict[str, List[Dict]] = {}
+    high_buckets: Dict[str, List[Dict]] = {}
+
+    for bucket, groups in data["buckets"].items():
+        low_groups: List[Dict] = []
+        high_groups: List[Dict] = []
+        for group in groups:
+            subj_key = "|".join(sorted(group.get("subjects", [])))
+            golden_sums = golden_index.get((bucket, subj_key), [])
+            low_recs: List[Dict] = []
+            high_recs: List[Dict] = []
+            for rec in group.get("records", []):
+                total += 1
+                if not golden_sums:
+                    rec["confidence"] = "low"
+                    low_recs.append(rec)
+                    low += 1
+                    continue
+                # 摘要相似度比对（找到任一 >= threshold 即命中）
+                # 数字归一化与文件内相似去重（_dedupe_similar_summaries）
+                # 同一口径：只差期间/年份的同类摘要（"暂估计提2024年12月
+                # 厂房电费" vs "2025年1月"）归一化后相似度才过 75%，
+                # 否则会被误判 low 白审一遍
+                matched = False
+                for gs in golden_sums:
+                    sim = difflib.SequenceMatcher(
+                        None, _normalize_summary(rec["summary"]),
+                        _normalize_summary(gs),
+                    ).ratio()
+                    if sim >= threshold:
+                        matched = True
+                        break
+                if matched:
+                    high_recs.append(rec)
+                    high += 1
+                else:
+                    rec["confidence"] = "low"
+                    low_recs.append(rec)
+                    low += 1
+            if low_recs:
+                low_groups.append({"subjects": group["subjects"], "records": low_recs})
+            if high_recs:
+                high_groups.append({"subjects": group["subjects"], "records": high_recs})
+        if low_groups:
+            low_buckets[bucket] = low_groups
+        if high_groups:
+            high_buckets[bucket] = high_groups
+
+    # 主文件: 只保留 low（AI 审核只看这里）
+    data["buckets"] = low_buckets
+    data["stats"] = {
+        "total_records": low,
+        "buckets": len(low_buckets),
+        "auto_approved": high,
+        "confidence_split": True,
+    }
+    atomic_write_json(unreviewed_path, data)
+
+    # high 记录直接并入金标准 training_data.json（AI 完全不读）
+    if high > 0:
+        # 读现有金标准（无则从空开始）
+        golden_merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        if golden_path.exists():
+            try:
+                old = json.loads(golden_path.read_text(encoding="utf-8"))
+                for rec in _flatten_buckets(old.get("buckets", {})):
+                    _merge_rec(golden_merged, rec["summary"], rec["subjects"],
+                               rec["bucket"], rec.get("count", 1))
+            except (json.JSONDecodeError, KeyError):
+                pass
+        # 并入 high 记录
+        for rec in _flatten_buckets(high_buckets):
+            _merge_rec(golden_merged, rec["summary"], rec["subjects"],
+                       rec["bucket"], rec.get("count", 1))
+        # 写回金标准（保留原有 source_hashes 并追加本次指纹）
+        # 注意: _merge_rec 的 value 结构是 {summary, subjects, buckets(众数), total}，
+        # 需要按 merge_training_data 的众数裁决逻辑展开
+        all_records = []
+        for entry in golden_merged.values():
+            bucket, count = max(entry["buckets"].items(), key=lambda kv: kv[1])
+            all_records.append({
+                "summary": entry["summary"],
+                "subjects": entry["subjects"],
+                "bucket": bucket,
+                "count": count,
+            })
+        all_records.sort(key=lambda r: (r["bucket"], r["summary"]))
+        gb = _aggregate_by_bucket(all_records)
+        _dedupe_similar_summaries(gb)
+        # 注意: 不把本文件 fingerprint 加入 source_hashes —— high 只是部分并入，
+        # 文件还有 low 记录待 AI 审核。等 AI 审完 merge 时才算完整消费并记入来源。
+        # 否则 merge 会因幂等判断（fingerprint 已存在）跳过该文件的 low 记录。
+        old_hashes = []
+        if golden_path.exists():
+            try:
+                old = json.loads(golden_path.read_text(encoding="utf-8"))
+                old_hashes = list(old.get("source_hashes", []))
+            except (json.JSONDecodeError, KeyError):
+                pass
+        golden_data = {
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "format": RECORDS_FORMAT,
+            "source_hashes": sorted(old_hashes),
+            "total_hashes": len(old_hashes),
+            # 与 merge_training_data 结构对齐：置信度拆分路径无这些统计，
+            # 置空值保持一致，供读侧统一取值
+            "skipped_unreviewed": 0,
+            "skipped_legacy_format": 0,
+            "skipped_consumed": 0,
+            "conflict_stats": {"total_conflicts": 0, "resolved_by_majority": 0},
+            "stats": {
+                "total_records": len(_flatten_buckets(gb)),
+                "buckets": len(gb),
+            },
+            "buckets": gb,
+        }
+        golden_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(golden_path, golden_data)
+        print(f"[OK] high={high} 条已直接并入金标准: {golden_path}")
+
+    result = {
+        "high": high,
+        "low": low,
+        "high_ratio": round(high / total, 4) if total else 0.0,
+        "total": total,
+        "golden_source": golden_source,
+    }
+    print(f"[OK] 置信度拆分完成: high={high} ({result['high_ratio']:.1%}) 已并入金标准"
+          f"（AI 不读）, low={low} 留在主文件供 AI 审核")
+    return result
