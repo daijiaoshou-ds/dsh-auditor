@@ -8,13 +8,13 @@
  * 不可构建的目录里，改一次就要能立刻被 loader 读到。
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-journal-workbench',
+  id: 'dsh-auditor',
   factory(require) {
     const React = require('react')
     const { useCallback, useEffect, useMemo, useRef, useState } = React
     const h = React.createElement
 
-    const NS = 'dsh-journal-workbench'
+    const NS = 'dsh-auditor'
     const API = '/plugin/journal'
 
     /** 哪些功能要模型（torch + 四件交付物）；其余只要有基础库就能跑。 */
