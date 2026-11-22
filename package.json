@@ -1,6 +1,6 @@
 {
   "name": "dsh-auditor",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "description": "审计工作台：序时账清洗 / 现金流量表编写 / 对方科目分析 / 会计分录测试",
   "repository": {
