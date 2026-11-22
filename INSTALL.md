@@ -8,7 +8,11 @@
 github:daijiaoshou-ds/dsh-auditor
 ```
 
-本目录装（zip 解压出来的那份）：
+离线装（GitHub 连不上时）：把 zip 解压到**一个固定目录**（例如 `D:\dsh-auditor`，
+别放下载目录——以后升级要覆盖同一目录），然后在 DSH 的 **插件 → 添加插件** 里填这个
+目录的绝对路径。升级时：插件页卸载 → 覆盖解压 → 重新添加 → 刷新/重启 DSH。
+
+命令行等价（不常用）：
 
 ```
 plugin_manager install_bundle  target=<本目录的绝对路径>
